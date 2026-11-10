@@ -56,7 +56,22 @@ export interface SearchArgs {
   since?: string;
   before?: string;
   unseen?: boolean;
+  has_attachments?: boolean;
+  exclude_saved?: boolean;
   limit: number;
+}
+
+/** IMAP keyword set on a message once its attachments were filed to Drive. */
+export const SAVED_KEYWORD = "$DriveSaved";
+
+/** Counts real attachments (not inline images / body parts) in an IMAP BODYSTRUCTURE. */
+function countAttachments(node: any): number {
+  if (!node) return 0;
+  if (node.childNodes?.length) return node.childNodes.reduce((n: number, c: any) => n + countAttachments(c), 0);
+  const name = node.dispositionParameters?.filename ?? node.parameters?.name;
+  if (node.disposition === "attachment") return 1;
+  if (name && node.disposition !== "inline" && !String(node.type).startsWith("text/")) return 1;
+  return 0;
 }
 
 export async function searchEmails(a: SearchArgs) {
@@ -71,15 +86,21 @@ export async function searchEmails(a: SearchArgs) {
       if (a.since) q.since = new Date(a.since);
       if (a.before) q.before = new Date(a.before);
       if (a.unseen) q.seen = false;
+      if (a.exclude_saved) q.unKeyword = SAVED_KEYWORD;
       if (Object.keys(q).length === 0) q.all = true;
 
-      const uids = (await c.search(q, { uid: true })) || [];
-      const pick = uids.slice(-a.limit).reverse(); // newest first
-      if (pick.length === 0) return [];
+      const uids = ((await c.search(q, { uid: true })) || []).reverse(); // newest first
+      // With has_attachments we have to inspect structures, so scan a larger window.
+      const scan = a.has_attachments ? uids.slice(0, Math.min(uids.length, a.limit * 10, 1000)) : uids.slice(0, a.limit);
+      if (scan.length === 0) return [];
 
-      const out: unknown[] = [];
-      for await (const m of c.fetch(pick, { envelope: true, flags: true, uid: true }, { uid: true })) {
+      const out: any[] = [];
+      for await (const m of c.fetch(scan, { envelope: true, flags: true, uid: true, bodyStructure: true }, { uid: true })) {
+        const attachments = countAttachments(m.bodyStructure);
+        if (a.has_attachments && attachments === 0) continue;
         out.push({
+          attachments,
+          drive_saved: m.flags?.has(SAVED_KEYWORD) ?? false,
           uid: m.uid,
           date: m.envelope?.date ? new Date(m.envelope.date).toISOString() : null,
           from: m.envelope?.from?.map((x) => `${x.name ?? ""} <${x.address}>`.trim()) ?? [],
@@ -88,7 +109,7 @@ export async function searchEmails(a: SearchArgs) {
           seen: m.flags?.has("\\Seen") ?? false,
         });
       }
-      return out.sort((x: any, y: any) => (y.uid as number) - (x.uid as number));
+      return out.sort((x, y) => y.uid - x.uid).slice(0, a.limit);
     } finally {
       lock.release();
     }
@@ -112,12 +133,66 @@ export async function getEmail(folder: string, uid: number, maxChars: number) {
         cc: Array.isArray(p.cc) ? p.cc.map((t) => t.text).join(", ") : p.cc?.text ?? "",
         subject: p.subject ?? "",
         text: text.length > maxChars ? text.slice(0, maxChars) + "\n…[gekürzt]" : text,
-        attachments: p.attachments.map((x) => ({ filename: x.filename, contentType: x.contentType, size: x.size })),
+        attachments: listAttachments(p.attachments),
       };
     } finally {
       lock.release();
     }
   });
+}
+
+type ParsedAttachment = Awaited<ReturnType<typeof simpleParser>>["attachments"][number];
+
+function isRealAttachment(x: ParsedAttachment) {
+  return !(x.related || (x.contentDisposition === "inline" && x.contentType.startsWith("image/")));
+}
+
+function listAttachments(atts: ParsedAttachment[]) {
+  return atts
+    .map((x, index) => ({ index, filename: x.filename ?? `anhang-${index}`, contentType: x.contentType, size: x.size, real: isRealAttachment(x) }))
+    .filter((x) => x.real)
+    .map(({ real, ...rest }) => rest);
+}
+
+export interface LoadedAttachment {
+  filename: string;
+  contentType: string;
+  content: Buffer;
+  mail: { uid: number; date: string | null; from: string; subject: string };
+}
+
+/** Downloads one attachment (by index from get_email) of a message. */
+export async function loadAttachment(folder: string, uid: number, index: number): Promise<LoadedAttachment> {
+  return withImap(async (c) => {
+    const lock = await c.getMailboxLock(folder);
+    try {
+      const msg = await c.fetchOne(String(uid), { source: true }, { uid: true });
+      if (!msg || !msg.source) throw new Error(`No message with UID ${uid} in ${folder}`);
+      const p = await simpleParser(msg.source);
+      const att = p.attachments[index];
+      if (!att) throw new Error(`Mail ${uid} hat keinen Anhang mit index ${index}`);
+      return {
+        filename: att.filename ?? `anhang-${index}`,
+        contentType: att.contentType,
+        content: att.content,
+        mail: { uid, date: p.date?.toISOString() ?? null, from: p.from?.text ?? "", subject: p.subject ?? "" },
+      };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/** Marks messages as filed to Drive (IMAP keyword). Best effort: some servers reject custom keywords. */
+export async function markSaved(folder: string, uids: number[]) {
+  return withImap(async (c) => {
+    const lock = await c.getMailboxLock(folder);
+    try {
+      return await c.messageFlagsAdd(uids.join(","), [SAVED_KEYWORD], { uid: true });
+    } finally {
+      lock.release();
+    }
+  }).catch(() => false);
 }
 
 export async function setFlags(folder: string, uids: number[], seen: boolean) {

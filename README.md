@@ -13,6 +13,9 @@ Läuft per Docker auf einem eigenen Server, Caddy davor sorgt für HTTPS.
 | `mark_emails` | gelesen / ungelesen markieren |
 | `move_emails` | in anderen Ordner verschieben (z.B. `Papierkorb`) |
 | `save_draft` | Entwurf in „Entwürfe“ ablegen |
+| `read_attachment` | Text eines Anhangs lesen (PDF/Text), um ihn einzuordnen |
+| `get_filing_rules` | Regeln: was abgelegt wird, geschäftlich vs. privat, Ordner- und Dateinamen |
+| `save_attachment_to_drive` | Anhang direkt nach Google Drive hochladen (nur wenn Google konfiguriert) |
 | `send_email` | senden über SMTP + Kopie in „Gesendet“ (abschaltbar mit `ALLOW_SEND=false`) |
 
 ## 1. web.de vorbereiten
@@ -78,6 +81,41 @@ claude mcp add --transport http webde https://<DOMAIN>/mcp --header "Authorizati
   }
 }
 ```
+
+## Google Drive: Anhänge einsortieren
+
+Claude prüft Mails mit Anhängen, liest Rechnungen & Co. (`read_attachment`), entscheidet
+**Automationsexperten** vs. **Privat** und lässt den Server die Datei direkt nach Drive hochladen:
+
+```
+Mail-Anhänge/
+├── Automationsexperten/Rechnungen/2026/2026-11-03_Hetzner_Server-Rechnung.pdf
+├── Privat/Versicherungen/2026/...
+└── Zu prüfen/...            ← wenn die Zuordnung unklar ist
+```
+
+Bereits abgelegte Mails bekommen das IMAP-Schlagwort `$DriveSaved` und werden beim nächsten
+Durchlauf übersprungen. Gleichnamige Dateien werden nicht überschrieben.
+In Claude Code startet der Prompt `/mcp__webde__anhaenge_einsortieren` den kompletten Ablauf.
+
+### Einrichtung (einmalig)
+
+1. <https://console.cloud.google.com> → neues Projekt, z. B. `webde-mcp`.
+2. **APIs & Dienste → Bibliothek → „Google Drive API“ → Aktivieren.**
+3. **Google Auth Platform / OAuth-Zustimmungsbildschirm**: Typ *Extern*, App-Name `webde-mcp`, eigene E-Mail eintragen.
+   Unter **Zielgruppe** auf **„App veröffentlichen“ (In Produktion)** stellen – im Test-Modus läuft der Zugang nach 7 Tagen ab.
+4. **Clients → Client erstellen → Typ „Desktop-App“** → Client-ID und Clientschlüssel kopieren.
+5. In `.env` eintragen: `GOOGLE_CLIENT_ID=…`, `GOOGLE_CLIENT_SECRET=…`, dann:
+   ```bash
+   docker compose up -d --build
+   docker compose run --rm webde-mcp node dist/google-auth.js
+   ```
+   Link öffnen, Google-Konto wählen (Warnung „App nicht überprüft“ → *Erweitert → Weiter*),
+   die `http://localhost/?code=…`-Adresse zurück ins Terminal kopieren.
+6. Ausgegebene Zeile `GOOGLE_REFRESH_TOKEN=…` in `.env` eintragen, optional `BUSINESS_HINTS`
+   (Firmenname, Adresse, USt-IdNr.), dann `docker compose up -d`.
+
+Berechtigung ist nur `drive.file`: Der Server sieht ausschließlich die Dateien und Ordner, die er selbst angelegt hat.
 
 ## Lokal testen
 

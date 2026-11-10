@@ -5,11 +5,41 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as mail from "./mail.js";
+import * as drive from "./drive.js";
+import { attachmentText } from "./extract.js";
 
 const TOKEN = process.env.MCP_AUTH_TOKEN ?? "";
 if (TOKEN.length < 32) throw new Error("MCP_AUTH_TOKEN must be set (>= 32 chars). Generate: openssl rand -hex 32");
 const PORT = Number(process.env.PORT ?? 3000);
 const ALLOW_SEND = (process.env.ALLOW_SEND ?? "true") === "true";
+const BUSINESS_NAME = process.env.BUSINESS_NAME ?? "Automationsexperten";
+const BUSINESS_HINTS = process.env.BUSINESS_HINTS ?? "";
+
+const FILING_RULES = `Ablage-Regeln für Mail-Anhänge (Drive-Wurzelordner: "${drive.DRIVE_ROOT}")
+
+1. NUR wichtige Dokumente ablegen: Rechnungen, Gutschriften, Quittungen/Belege, Verträge,
+   Kündigungen/Bestätigungen, Steuer- und Behördendokumente, Versicherungspolicen.
+   NICHT ablegen: Newsletter, Werbung, Logos/Signatur-Bilder, Kalendereinladungen (.ics),
+   AGB/Datenschutz-PDFs, Präsentationen ohne Belegcharakter, Duplikate.
+
+2. Zuordnung geschäftlich vs. privat – vorher immer read_attachment nutzen:
+   - "${BUSINESS_NAME}": Dokument ist an ${BUSINESS_NAME} adressiert (Rechnungsempfänger,
+     Firmenname, USt-IdNr., Geschäftsadresse) ODER es geht um Betriebsausgaben/-einnahmen
+     (Software-Abos, Hosting, Domains, Werbung, Kundenrechnungen, Beratungsleistungen).${BUSINESS_HINTS ? "\n     Erkennungsmerkmale: " + BUSINESS_HINTS : ""}
+   - "Privat": an die Privatperson adressiert und privater Zweck (Strom/Wohnung, private
+     Versicherungen, Onlineshopping für privat, Arzt, Freizeit).
+   - Unklar → NICHT raten: nachfragen oder in "Zu prüfen" ablegen.
+
+3. Pfad (drive_path): <${BUSINESS_NAME}|Privat|Zu prüfen>/<Kategorie>/<Jahr des Dokuments>
+   Kategorien: Rechnungen, Gutschriften, Belege, Verträge, Steuer, Versicherungen, Sonstiges
+   Beispiel: "${BUSINESS_NAME}/Rechnungen/2026"
+
+4. Dateiname: JJJJ-MM-TT_Absender_Kurzbeschreibung.pdf (Datum = Rechnungs-/Dokumentdatum),
+   z.B. "2026-11-03_Hetzner_Server-Rechnung.pdf". Endung des Originals beibehalten.
+
+5. Ablauf: search_emails(has_attachments=true, exclude_saved=true) → get_email → read_attachment
+   → entscheiden → save_attachment_to_drive. Am Ende kurz berichten, was wohin abgelegt wurde
+   und was übersprungen wurde (mit Grund).`;
 
 /** imapflow throws a bare "Command failed"; surface the server's actual answer. */
 function describeError(e: unknown): string {
@@ -57,6 +87,8 @@ function buildServer() {
         since: z.string().optional().describe("ISO-Datum, z.B. 2026-11-01"),
         before: z.string().optional(),
         unseen: z.boolean().optional().describe("Nur ungelesene"),
+        has_attachments: z.boolean().optional().describe("Nur Mails mit echten Anhängen"),
+        exclude_saved: z.boolean().optional().describe("Mails auslassen, deren Anhänge schon in Drive abgelegt wurden"),
         limit: z.number().int().min(1).max(200).default(20),
       },
       annotations: { readOnlyHint: true },
@@ -77,6 +109,99 @@ function buildServer() {
     },
     wrap((a: { folder: string; uid: number; max_chars: number }) => mail.getEmail(a.folder, a.uid, a.max_chars)),
   );
+
+  s.registerTool(
+    "read_attachment",
+    {
+      description:
+        "Liest den Textinhalt eines Anhangs (PDF, Text) – zum Prüfen, ob es eine Rechnung o.ä. ist und ob sie " +
+        `${BUSINESS_NAME} oder privat betrifft. index aus get_email.attachments.`,
+      inputSchema: {
+        folder: z.string().default("INBOX"),
+        uid: z.number().int(),
+        index: z.number().int().min(0),
+        max_chars: z.number().int().default(6000),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    wrap(async (a: { folder: string; uid: number; index: number; max_chars: number }) => {
+      const att = await mail.loadAttachment(a.folder, a.uid, a.index);
+      return {
+        filename: att.filename,
+        contentType: att.contentType,
+        size: att.content.length,
+        mail: att.mail,
+        text: await attachmentText(att.contentType, att.filename, att.content, a.max_chars),
+      };
+    }),
+  );
+
+  s.registerTool(
+    "get_filing_rules",
+    {
+      description: "Liefert die Regeln, welche Anhänge wie in Google Drive einsortiert werden. Vor dem Einsortieren aufrufen.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => ({ content: [{ type: "text" as const, text: FILING_RULES }] }),
+  );
+
+  if (drive.driveConfigured()) {
+    s.registerTool(
+      "save_attachment_to_drive",
+      {
+        description:
+          `Lädt einen Mail-Anhang direkt in Google Drive (unter "${drive.DRIVE_ROOT}/<drive_path>/<filename>"), ` +
+          "fehlende Ordner werden angelegt, vorhandene Dateien gleichen Namens nicht überschrieben. " +
+          "Markiert die Mail danach als abgelegt. Vorher get_filing_rules beachten.",
+        inputSchema: {
+          folder: z.string().default("INBOX"),
+          uid: z.number().int(),
+          index: z.number().int().min(0).describe("Index aus get_email.attachments"),
+          drive_path: z.string().describe(`z.B. "${BUSINESS_NAME}/Rechnungen/2026" oder "Privat/Verträge/2025"`),
+          filename: z.string().optional().describe("Zieldateiname, z.B. 2026-11-03_Hetzner_Server-Rechnung.pdf"),
+          mark_saved: z.boolean().default(true),
+        },
+      },
+      wrap(
+        async (a: { folder: string; uid: number; index: number; drive_path: string; filename?: string; mark_saved: boolean }) => {
+          if (a.drive_path.includes("..")) throw new Error("Ungültiger drive_path");
+          const att = await mail.loadAttachment(a.folder, a.uid, a.index);
+          const name = (a.filename?.trim() || att.filename).replace(/[\\/:*?"<>|]/g, "-");
+          const r = await drive.uploadFile(
+            a.drive_path,
+            name,
+            att.contentType,
+            att.content,
+            `Aus web.de-Mail: ${att.mail.subject} — von ${att.mail.from} (${att.mail.date ?? ""})`,
+          );
+          const marked = a.mark_saved ? await mail.markSaved(a.folder, [a.uid]) : false;
+          return { ...r, mail_marked: Boolean(marked) };
+        },
+      ),
+    );
+
+    s.registerPrompt(
+      "anhaenge_einsortieren",
+      {
+        description: "Wichtige Mail-Anhänge (Rechnungen etc.) prüfen und geschäftlich/privat in Google Drive ablegen",
+        argsSchema: { seit: z.string().optional().describe("ISO-Datum, ab wann (Standard: letzte 30 Tage)") },
+      },
+      ({ seit }) => ({
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text:
+                `Sortiere die wichtigen Anhänge aus meinem web.de-Posteingang seit ${seit ?? "den letzten 30 Tagen"} ` +
+                `in Google Drive ein. Halte dich strikt an diese Regeln:\n\n${FILING_RULES}`,
+            },
+          },
+        ],
+      }),
+    );
+  }
 
   s.registerTool(
     "mark_emails",
