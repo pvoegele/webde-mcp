@@ -11,6 +11,19 @@ if (TOKEN.length < 32) throw new Error("MCP_AUTH_TOKEN must be set (>= 32 chars)
 const PORT = Number(process.env.PORT ?? 3000);
 const ALLOW_SEND = (process.env.ALLOW_SEND ?? "true") === "true";
 
+/** imapflow throws a bare "Command failed"; surface the server's actual answer. */
+function describeError(e: unknown): string {
+  const err = e as Error & { responseText?: string; authenticationFailed?: boolean; serverResponseCode?: string; code?: string };
+  const parts = [err.message];
+  if (err.authenticationFailed)
+    parts.push("Anmeldung bei web.de fehlgeschlagen – IMAP-Zugriff in den web.de-Einstellungen aktiviert? Passwort/App-Passwort korrekt?");
+  if (err.serverResponseCode) parts.push(`Code: ${err.serverResponseCode}`);
+  if (err.responseText) parts.push(`Server: ${err.responseText}`);
+  if (err.code) parts.push(`(${err.code})`);
+  console.error("[tool error]", parts.join(" | "));
+  return parts.join(" | ");
+}
+
 const json = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] });
 const wrap =
   <A>(fn: (a: A) => Promise<unknown>) =>
@@ -18,7 +31,7 @@ const wrap =
     try {
       return json(await fn(a));
     } catch (e) {
-      return { isError: true, content: [{ type: "text" as const, text: `Fehler: ${(e as Error).message}` }] };
+      return { isError: true, content: [{ type: "text" as const, text: `Fehler: ${describeError(e)}` }] };
     }
   };
 
