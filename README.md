@@ -30,11 +30,33 @@ cp .env.example .env
 openssl rand -hex 32        # → als MCP_AUTH_TOKEN in .env eintragen
 nano .env                   # DOMAIN, WEBDE_USER, WEBDE_PASSWORD setzen
 chmod 600 .env
-docker compose up -d --build
+docker compose --profile caddy up -d --build   # siehe Varianten unten
 curl https://<DOMAIN>/health   # → {"ok":true}
 ```
 
 Update: `git pull && docker compose up -d --build`
+
+### Variante A: Server hat noch keinen Webserver auf 80/443
+
+```bash
+docker compose --profile caddy up -d --build
+```
+
+### Variante B: Es läuft schon ein Reverse-Proxy (z.B. Caddy von n8n)
+
+1. In `.env` ergänzen (Netzname mit `docker inspect <proxy-container>` ermitteln):
+   ```
+   PROXY_NETWORK=n8n_default
+   COMPOSE_FILE=docker-compose.yml:docker-compose.shared-proxy.yml
+   ```
+2. `docker compose up -d --build`
+3. Im Caddyfile des vorhandenen Proxys ergänzen und Caddy neu laden:
+   ```
+   46-224-219-63.sslip.io {
+   	reverse_proxy webde-mcp:3000
+   }
+   ```
+   `docker exec <proxy-container> caddy reload --config /etc/caddy/Caddyfile`
 
 ## 3. In Claude einbinden
 

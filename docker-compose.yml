@@ -6,8 +6,11 @@ services:
     expose:
       - "3000"
 
+  # Eigener Caddy nur, wenn auf dem Server noch kein Reverse-Proxy auf 80/443 läuft:
+  #   docker compose --profile caddy up -d
   caddy:
     image: caddy:2
+    profiles: ["caddy"]
     restart: unless-stopped
     ports:
       - "80:80"

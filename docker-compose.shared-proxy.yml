@@ -1,0 +1,19 @@
+# Nutzt einen bereits laufenden Reverse-Proxy (z.B. den Caddy von n8n).
+# Der MCP-Container tritt dem Docker-Netz des Proxys bei und ist dort als
+# "webde-mcp:3000" erreichbar.
+#
+# In .env setzen:
+#   PROXY_NETWORK=<Netzname des Proxys, z.B. n8n_default>
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.shared-proxy.yml
+services:
+  webde-mcp:
+    networks:
+      default:
+      proxy:
+        aliases:
+          - webde-mcp
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK}
